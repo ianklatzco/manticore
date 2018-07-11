@@ -1,6 +1,7 @@
 from abc import ABCMeta, abstractmethod, abstractproperty
 from weakref import WeakValueDictionary
 from .smtlib import *
+import functools
 import logging
 from ..utils.mappings import mmap, munmap
 from ..utils.helpers import issymbolic
@@ -1093,32 +1094,50 @@ class LazySMemory(SMemory):
     Currently does not support cross-page reads/writes.
     '''
 
-    def __reduce__(self):
-        return (self.__class__, (self.constraints, self._symbols, self._maps), {'backing_array': self.bigarray })
-
-    def __setstate__(self, state):
-        self.bigarray = state['backing_array']
-
     def __init__(self, constraints, *args, **kwargs):
         super(LazySMemory, self).__init__(constraints, *args, **kwargs)
-        # self.bigarray = ArrayMap(0, 2**32 - 1, 'rwx', 32, name='bigarray')
-        # self.bigarray = ArrayMap(0, 2**32 - 1, 'rwx', 32, name='bigarray')
-        self.bigarray = constraints.new_array(index_bits=self.memory_bit_size)
+        self._backing_array = constraints.new_array(index_bits=self.memory_bit_size)
 
+    def __reduce__(self):
+        return (self.__class__, (self.constraints, self._symbols, self._maps), {'backing_array': self._backing_array})
+
+    def __setstate__(self, state):
+        self._backing_array = state['backing_array']
 
     def mmapFile(self, addr, size, perms, filename, offset=0):
         addr = super(LazySMemory, self).mmapFile(addr, size, perms, filename, offset)
         m = self.map_containing(addr)
         for offset in range(m.start, m.end):
-            self.bigarray[offset] = m[offset]
+            self._backing_array[offset] = m[offset]
         return addr
 
-    def _deref_can_succeed(self, map, address, size):
-        if not issymbolic(address):
-            return address >= map.start and address + size < map.end
-        else:
-            constraint = Operators.AND(address >= map.start, address + size < map.end)
-            return solver.can_be_true(self.constraints, constraint)
+    def _in_map(self, m, addr, size, perm='r'):
+        '''
+        Return an expression or a value describing whether an address is inside a map m.
+
+        '''
+        return Operators.AND(Operators.UGE(addr, m.start),
+                             Operators.ULT(addr + size, m.end),
+                             perm in m.perms)
+
+    def _deref_possible(self, address, length, perm='r'):
+        '''
+        Return a concrete value, or an expression, on whether the current address is inside of
+        mapped memory, and has valid permissions
+        '''
+        return Operators.OR(*[self._in_map(m, address, length, perm) for m in self.maps])
+
+    def can_fault(self, address, length, perm='r'):
+        result = []
+        for offset in range(address, address+length):
+            faulting = Operators.NOT(self._deref_possible(offset, 1, perm))
+            if issymbolic(faulting):
+                if solver.can_be_true(self.constraints, faulting):
+                    result.append(offset)
+            else:
+                if faulting:
+                    result.append(offset)
+        return result
 
     def map_containing(self, address):
         if not issymbolic(address):
@@ -1126,7 +1145,8 @@ class LazySMemory(SMemory):
         else:
             found = None
             for m in self._maps:
-                if self._deref_can_succeed(m, address, 1):
+                in_map = self._in_map(m, address, 1)
+                if solver.can_be_true(self.constraints, in_map):
                     if not isinstance(m, ArrayMap):
                         continue
                     if found:
@@ -1135,50 +1155,50 @@ class LazySMemory(SMemory):
             return found
 
     def read(self, address, size, force=False):
-        def _constrain_to_maps(cs, mappings, where):
-            # maps = state.cpu.memory.mappings()
-            maps = mappings
+        ##def _constrain_to_maps(cs, mappings, where):
+        #    # maps = state.cpu.memory.mappings()
+        #    maps = mappings
 
-            from manticore.core.smtlib.operators import UGE, ULT, OR
+        #    from manticore.core.smtlib.operators import UGE, ULT, OR
 
-            cons = []
-            print(maps)
-            for map in maps:
-                print(33)
-                start, end = map[:2]
+        #    cons = []
+        #    print(maps)
+        #    for map in maps:
+        #        print(33)
+        #        start, end = map[:2]
 
-                startcons = UGE(where, start)
-                endcons = ULT(where, end)
+        #        startcons = UGE(where, start)
+        #        endcons = ULT(where, end)
 
-                c = startcons & endcons
-                cons.append(c)
+        #        c = startcons & endcons
+        #        cons.append(c)
 
-                logger.info('map', hex(start), hex(end))
+        #        logger.info('map', hex(start), hex(end))
 
-            if len(cons) > 1:
-                big = OR(*cons)
-            else:
-                big = cons[0]
+        #    if len(cons) > 1:
+        #        big = OR(*cons)
+        #    else:
+        #        big = cons[0]
 
-            cs.add(big)
+        #    cs.add(big)
             # state.constrain(big)
 
         # print 'address', address, 'size', size
         if issymbolic(address):
-            # TODO FIXME what to do here? constrain to maps and continue?
-            # don't constrain to maps because then we can't distinguish later if a solution isn't SAT because of maps
-            # or because of the actual code
+            # XXX(yan): If the below is uncommented, it'll fault trying to print it, and z3 will
+            # fail at solving it
 
-            # sym access, constrain to maps and continue
+            #must_fault = Operators.NOT(self._deref_possible(address, size))
+            #if solver.can_be_true(self.constraints, must_fault):
+            #    raise InvalidMemoryAccess(address, 'r')
             pass
-            # _constrain_to_maps(self.constraints, self.mappings(), address)
         else:
             if not self.access_ok(slice(address, address + size), 'r', force):
                 raise InvalidMemoryAccess(address, 'r')
 
         page_offset = address
         # print 'mem read', hex(address), size
-        ret = self.bigarray[page_offset:page_offset + size]
+        ret = self._backing_array[page_offset:page_offset + size]
         # print 'got the ret', ret
         return ret
 
@@ -1201,7 +1221,7 @@ class LazySMemory(SMemory):
         # print 'mem write', hex(address), value
         from ..core.smtlib import pretty_print
         # print 'pre write', pretty_print(self.bigarray.array)
-        self.bigarray[page_offset:page_offset + len(value)] = value
+        self._backing_array[page_offset:page_offset + len(value)] = value
         # print 'post write', pretty_print(self.bigarray.array)
         return
 
