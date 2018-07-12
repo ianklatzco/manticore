@@ -1128,9 +1128,11 @@ class LazySMemory(SMemory):
         return Operators.OR(*[self._in_map(m, address, length, perm) for m in self.maps])
 
     def can_fault(self, address, length, perm='r'):
+        assert not issymbolic(length)
+
         result = []
-        for offset in range(address, address+length):
-            faulting = Operators.NOT(self._deref_possible(offset, 1, perm))
+        for offset in range(length):
+            faulting = Operators.NOT(self._deref_possible(address+offset, 1, perm))
             if issymbolic(faulting):
                 if solver.can_be_true(self.constraints, faulting):
                     result.append(offset)
